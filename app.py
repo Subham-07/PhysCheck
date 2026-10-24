@@ -32,6 +32,8 @@ from ai_analyzer import (
     MalformedResponseError,
     MissingAPIKeyError,
     QuotaExceededError,
+    RetriesExhaustedError,
+    ServiceUnavailableError,
     SUGGESTIONS_NOTICE,
     UnsupportedModelError,
 )
@@ -693,48 +695,69 @@ def main() -> None:
                     )
 
                 if analyze_ai:
-                    with st.spinner(f"Requesting physical reasoning from {DEFAULT_MODEL_IDENTIFIER}..."):
-                        try:
-                            analyzer = AIAnalyzer()
-                            ai_res = analyzer.analyze_expression(current_expr)
-                            st.session_state["ai_result"] = ai_res
+                    status_placeholder = st.empty()
+                    status_placeholder.info(f"Requesting physical reasoning from {DEFAULT_MODEL_IDENTIFIER}...")
 
-                            # Merge candidate units as UNCONFIRMED suggestions
-                            for v, u in ai_res.candidate_units.items():
-                                if v in active_vars:
-                                    if not st.session_state["confirmed_flags"].get(v, False) or not st.session_state["user_units"].get(v):
-                                        st.session_state["user_units"][v] = u
-                                        st.session_state["confirmed_flags"][v] = False
-                                        st.session_state["unit_sources"][v] = f"Gemma 4 ({DEFAULT_MODEL_IDENTIFIER})"
+                    def on_retry_status(attempt: int, max_retries: int, delay: float, exc: Exception) -> None:
+                        status_placeholder.info(
+                            f"AI service is temporarily busy. Retrying... (attempt {attempt} of {max_retries})"
+                        )
 
-                            # Merge meanings if available
-                            for vm in ai_res.variable_meanings:
-                                if vm.variable in active_vars and vm.meaning:
-                                    if st.session_state["variable_meanings"].get(vm.variable) in ("", "Meaning not provided"):
-                                        st.session_state["variable_meanings"][vm.variable] = vm.meaning
+                    try:
+                        analyzer = AIAnalyzer()
+                        ai_res = analyzer.analyze_expression(current_expr, on_retry=on_retry_status)
+                        status_placeholder.empty()
 
-                            st.success("Gemma 4 suggestions received. Review the candidate units above and click Confirm.")
-                            st.rerun()
-                        except MissingAPIKeyError:
-                            st.warning(
-                                "What was detected: GEMINI_API_KEY environment variable is not set.\n\n"
-                                "Why it matters: AI suggestions require a Google GenAI API key in .env.\n\n"
-                                "What to do next: Define GEMINI_API_KEY in your .env file, or type units manually. Deterministic checks work 100% offline."
-                            )
-                        except AuthenticationError as e:
-                            st.error(f"Authentication failed: {e}. Check that your GEMINI_API_KEY is valid.")
-                        except UnsupportedModelError as e:
-                            st.error(f"Model unavailable: {e}. PhysCheck does not substitute alternative models.")
-                        except QuotaExceededError as e:
-                            st.error(f"API quota exceeded: {e}.")
-                        except AIAnalyzerTimeoutError as e:
-                            st.error(f"Request timed out: {e}.")
-                        except MalformedResponseError as e:
-                            st.error(f"Model response was malformed: {e}.")
-                        except AIAnalysisError as e:
+                        # Merge candidate units as UNCONFIRMED suggestions
+                        for v, u in ai_res.candidate_units.items():
+                            if v in active_vars:
+                                if not st.session_state["confirmed_flags"].get(v, False) or not st.session_state["user_units"].get(v):
+                                    st.session_state["user_units"][v] = u
+                                    st.session_state["confirmed_flags"][v] = False
+                                    st.session_state["unit_sources"][v] = f"Gemma 4 ({DEFAULT_MODEL_IDENTIFIER})"
+
+                        # Merge meanings if available
+                        for vm in ai_res.variable_meanings:
+                            if vm.variable in active_vars and vm.meaning:
+                                if st.session_state["variable_meanings"].get(vm.variable) in ("", "Meaning not provided"):
+                                    st.session_state["variable_meanings"][vm.variable] = vm.meaning
+
+                        st.success("Gemma 4 suggestions received. Review the candidate units above and click Confirm.")
+                        st.rerun()
+                    except (ServiceUnavailableError, RetriesExhaustedError):
+                        status_placeholder.empty()
+                        st.warning("AI suggestions are temporarily unavailable. You can enter variable meanings and units manually, or try again later.")
+                    except QuotaExceededError:
+                        status_placeholder.empty()
+                        st.warning("AI suggestions are temporarily unavailable. You can enter variable meanings and units manually, or try again later.")
+                    except AIAnalyzerTimeoutError:
+                        status_placeholder.empty()
+                        st.warning("AI suggestions are temporarily unavailable. You can enter variable meanings and units manually, or try again later.")
+                    except MissingAPIKeyError:
+                        status_placeholder.empty()
+                        st.warning(
+                            "What was detected: GEMINI_API_KEY environment variable is not set.\n\n"
+                            "Why it matters: AI suggestions require a Google GenAI API key in .env.\n\n"
+                            "What to do next: Define GEMINI_API_KEY in your .env file, or type units manually. Deterministic checks work 100% offline."
+                        )
+                    except AuthenticationError as e:
+                        status_placeholder.empty()
+                        st.error(f"Authentication failed: {e}. Check that your GEMINI_API_KEY is valid.")
+                    except UnsupportedModelError as e:
+                        status_placeholder.empty()
+                        st.error(f"Model unavailable: {e}. PhysCheck does not substitute alternative models.")
+                    except MalformedResponseError as e:
+                        status_placeholder.empty()
+                        st.error(f"Model response was malformed: {e}.")
+                    except AIAnalysisError as e:
+                        status_placeholder.empty()
+                        if "temporarily unavailable" in str(e).lower() or "503" in str(e):
+                            st.warning("AI suggestions are temporarily unavailable. You can enter variable meanings and units manually, or try again later.")
+                        else:
                             st.error(f"AI analysis failed: {e}.")
-                        except Exception as e:
-                            st.error(f"Unexpected error: {type(e).__name__} - {e}")
+                    except Exception as e:
+                        status_placeholder.empty()
+                        st.error(f"Unexpected error: {type(e).__name__} - {e}")
 
     # =========================================================================
     # Step 3 — Check Action

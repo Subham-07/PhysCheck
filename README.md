@@ -65,8 +65,8 @@ PhysCheck/
 └── tests/
     ├── test_sanity.py         # Environment and dependency sanity tests
     ├── test_checker.py        # 13 tests for AST rules, Pint units, and dimensional logic
-    ├── test_ai_analyzer.py    # 13 mocked tests for Gemma 4 integration and error states
-    ├── test_app.py            # 18 tests for Streamlit UI guided workflow, exclusivity, and security limits
+    ├── test_ai_analyzer.py    # 18 tests for Gemma 4 integration, transient 503 retry backoff, and error handling
+    ├── test_app.py            # 20 tests for Streamlit UI guided workflow, exclusivity, and security limits
     └── test_verify_math.py    # 6 end-to-end CLI integration tests
 ```
 
@@ -266,7 +266,7 @@ Disclaimer:      PASS means only that the supported check passed under the suppl
 
 ## Running Automated Tests
 
-PhysCheck includes an automated test suite with 50 tests covering sanity checks, deterministic AST evaluation, Pint dimensional compatibility, mocked Gemma 4 API integrations, CLI behavior, and Streamlit workflows.
+PhysCheck includes an automated test suite with 57 tests covering sanity checks, deterministic AST evaluation, Pint dimensional compatibility, mocked Gemma 4 API integrations, CLI behavior, and Streamlit workflows.
 
 Execute the test suite using pytest:
 ```powershell
@@ -442,7 +442,7 @@ Contributions to PhysCheck are welcome! Please observe the following principles:
 1. **Preserve Safety Guarantees**: Never introduce `eval()`, `exec()`, or dynamic code execution into equation evaluation.
 2. **Preserve Disclaimer Integrity**: Any new reporting or output mode must preserve the mandatory disclaimer that `PASS` applies strictly to supported checks under confirmed assumptions.
 3. **Strict Human Confirmation**: AI-generated units must always remain preliminary suggestions until confirmed by a user.
-4. **Comprehensive Testing**: All new features or syntax support must include corresponding tests in `tests/`. Ensure all 50 existing tests pass:
+4. **Comprehensive Testing**: All new features or syntax support must include corresponding tests in `tests/`. Ensure all 57 existing tests pass:
    ```powershell
    .\.venv\Scripts\python.exe -m pytest -v
    ```

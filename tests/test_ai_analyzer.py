@@ -21,6 +21,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from ai_analyzer import (
+    AIAnalysisError,
     AIAnalysisResult,
     AIAnalyzer,
     AIAnalyzerTimeoutError,
@@ -30,6 +31,8 @@ from ai_analyzer import (
     MalformedResponseError,
     MissingAPIKeyError,
     QuotaExceededError,
+    RetriesExhaustedError,
+    ServiceUnavailableError,
     SUGGESTIONS_NOTICE,
     UnsupportedModelError,
     get_gemini_api_key,
@@ -240,7 +243,7 @@ def test_quota_exceeded_error_handling():
     )
     mock_client.models.generate_content.side_effect = api_error
 
-    analyzer = AIAnalyzer(api_key="mock_key", client=mock_client)
+    analyzer = AIAnalyzer(api_key="mock_key", client=mock_client, initial_delay=0.001)
     with pytest.raises(QuotaExceededError) as exc_info:
         analyzer.analyze_expression("F = m * a")
 
@@ -256,7 +259,7 @@ def test_timeout_error_handling():
     )
     mock_client.models.generate_content.side_effect = api_error
 
-    analyzer = AIAnalyzer(api_key="mock_key", client=mock_client)
+    analyzer = AIAnalyzer(api_key="mock_key", client=mock_client, initial_delay=0.001)
     with pytest.raises(AIAnalyzerTimeoutError) as exc_info:
         analyzer.analyze_expression("F = m * a")
 
@@ -326,3 +329,127 @@ def test_ai_to_checker_workflow():
     assert check_res.status == CheckStatus.PASS
     assert check_res.is_pass
     assert check_res.evidence["dimensionality_match"] is True
+
+
+# 14. 503 Retry Success
+def test_503_retry_success():
+    """Verify that transient HTTP 503 errors trigger retries and return success if subsequent attempt succeeds."""
+    mock_client = MagicMock()
+    err_503 = errors.APIError(code=503, response_json={"error": {"message": "Service Unavailable", "code": 503}})
+    mock_response = MagicMock()
+    mock_response.text = json.dumps(VALID_MOCK_PAYLOAD)
+
+    # First attempt fails with 503, second attempt succeeds
+    mock_client.models.generate_content.side_effect = [err_503, mock_response]
+
+    retries_recorded = []
+    def on_retry_cb(attempt, max_retries, delay, exc):
+        retries_recorded.append((attempt, max_retries, delay, exc))
+
+    analyzer = AIAnalyzer(api_key="mock_key", client=mock_client, initial_delay=0.001)
+    result = analyzer.analyze_expression("v = d / t", on_retry=on_retry_cb)
+
+    assert isinstance(result, AIAnalysisResult)
+    assert mock_client.models.generate_content.call_count == 2
+    assert len(retries_recorded) == 1
+    assert retries_recorded[0][0] == 1
+    assert retries_recorded[0][1] == 3
+
+
+# 15. 503 Retries Exhausted
+def test_503_retries_exhausted():
+    """Verify that exhausting all 3 retries for HTTP 503 raises ServiceUnavailableError with clear guidance."""
+    mock_client = MagicMock()
+    err_503 = errors.APIError(code=503, response_json={"error": {"message": "Service Unavailable", "code": 503}})
+    mock_client.models.generate_content.side_effect = err_503
+
+    retries_recorded = []
+    def on_retry_cb(attempt, max_retries, delay, exc):
+        retries_recorded.append((attempt, max_retries, delay, exc))
+
+    analyzer = AIAnalyzer(api_key="mock_key", client=mock_client, initial_delay=0.001, max_retries=3)
+    with pytest.raises(ServiceUnavailableError) as exc_info:
+        analyzer.analyze_expression("E = m * c ** 2", on_retry=on_retry_cb)
+
+    # Initial attempt + 3 retries = 4 total calls
+    assert mock_client.models.generate_content.call_count == 4
+    assert len(retries_recorded) == 3
+    assert (
+        "AI suggestions are temporarily unavailable. "
+        "You can enter variable meanings and units manually, or try again later."
+    ) in str(exc_info.value)
+
+
+# 16. Non-retryable Errors (401, 403, 404, 400) Are Never Retried
+def test_non_retryable_errors_not_retried():
+    """Verify that client errors (invalid key, permission, model not found, bad request) fail immediately."""
+    mock_client = MagicMock()
+
+    # 401 Unauthorized
+    err_401 = errors.APIError(code=401, response_json={"error": {"message": "API_KEY_INVALID"}})
+    mock_client.models.generate_content.side_effect = err_401
+    analyzer = AIAnalyzer(api_key="mock_key", client=mock_client, initial_delay=0.001)
+    with pytest.raises(AuthenticationError):
+        analyzer.analyze_expression("a + b")
+    assert mock_client.models.generate_content.call_count == 1
+
+    # 404 Model Not Found
+    mock_client.reset_mock()
+    err_404 = errors.APIError(code=404, response_json={"error": {"message": "models/gemma-4-31b-it not found"}})
+    mock_client.models.generate_content.side_effect = err_404
+    with pytest.raises(UnsupportedModelError):
+        analyzer.analyze_expression("a + b")
+    assert mock_client.models.generate_content.call_count == 1
+
+    # 400 Bad Request
+    mock_client.reset_mock()
+    err_400 = errors.APIError(code=400, response_json={"error": {"message": "INVALID_ARGUMENT"}})
+    mock_client.models.generate_content.side_effect = err_400
+    with pytest.raises(AIAnalysisError):
+        analyzer.analyze_expression("a + b")
+    assert mock_client.models.generate_content.call_count == 1
+
+
+# 17. Exponential Backoff Delays and Timing
+def test_exponential_backoff_delays():
+    """Verify that retry delays follow exponential backoff: delay = initial * (backoff ^ attempt)."""
+    mock_client = MagicMock()
+    err_503 = errors.APIError(code=503, response_json={"error": {"message": "Service Unavailable"}})
+    mock_client.models.generate_content.side_effect = err_503
+
+    delays = []
+    def on_retry_cb(attempt, max_retries, delay, exc):
+        delays.append(delay)
+
+    analyzer = AIAnalyzer(
+        api_key="mock_key",
+        client=mock_client,
+        initial_delay=1.0,
+        backoff_factor=2.0,
+        max_retries=3,
+    )
+    with patch("time.sleep"):
+        with pytest.raises(ServiceUnavailableError):
+            analyzer.analyze_expression("x", on_retry=on_retry_cb)
+
+    # Delays for attempt 0, 1, 2: 1.0, 2.0, 4.0
+    assert delays == [1.0, 2.0, 4.0]
+
+
+# 18. Overall Timeout During Retries
+def test_overall_timeout_during_retries():
+    """Verify that exceeding overall timeout aborts retries with AIAnalyzerTimeoutError."""
+    mock_client = MagicMock()
+    err_503 = errors.APIError(code=503, response_json={"error": {"message": "Service Unavailable"}})
+    mock_client.models.generate_content.side_effect = err_503
+
+    analyzer = AIAnalyzer(
+        api_key="mock_key",
+        client=mock_client,
+        initial_delay=10.0,
+        overall_timeout=5.0,
+    )
+    with pytest.raises(AIAnalyzerTimeoutError) as exc_info:
+        analyzer.analyze_expression("x")
+    assert "timeout" in str(exc_info.value).lower()
+

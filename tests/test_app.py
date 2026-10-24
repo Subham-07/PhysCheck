@@ -449,3 +449,68 @@ def test_format_result_diagnostics_coverage():
     assert "unsupported syntax" in diag_unsup_syntax["what"].lower()
     assert "simplify" in diag_unsup_syntax["next_action"].lower()
 
+
+# 11. Service Unavailable & Manual Entry Workflow Tests
+def test_service_unavailable_message_and_manual_entry_workflow():
+    """Verify that when AI suggestions fail (503 / unavailable), the user can enter units manually and verify."""
+    from ai_analyzer import ServiceUnavailableError
+    from checker import check_expression, CheckStatus
+
+    # 1. Exact required message
+    expected_msg = (
+        "AI suggestions are temporarily unavailable. "
+        "You can enter variable meanings and units manually, or try again later."
+    )
+    err = ServiceUnavailableError(expected_msg)
+    assert expected_msg in str(err)
+
+    # 2. Manual entry works 100% offline without AI
+    manual_units = {"distance": "meter", "time": "second"}
+    res = check_expression("distance / time", variable_units=manual_units)
+    assert res.status == CheckStatus.PASS
+    assert res.is_pass
+    assert res.evidence["inferred_unit"] == "meter / second"
+
+
+def test_streamlit_apptest_service_unavailable_handling():
+    """Verify Streamlit AppTest handles ServiceUnavailableError by displaying warning message."""
+    import asyncio
+    from pathlib import Path
+    from streamlit.testing.v1 import AppTest
+    from ai_analyzer import ServiceUnavailableError
+
+    mock_loop = MagicMock(spec=asyncio.AbstractEventLoop)
+    mock_loop.is_closed.return_value = False
+
+    expected_msg = (
+        "AI suggestions are temporarily unavailable. "
+        "You can enter variable meanings and units manually, or try again later."
+    )
+
+    with patch("asyncio.new_event_loop", return_value=mock_loop), \
+         patch("ai_analyzer.AIAnalyzer.analyze_expression", side_effect=ServiceUnavailableError(expected_msg)):
+
+        app_path = str(Path(__file__).resolve().parent.parent / "app.py")
+        at = AppTest.from_file(app_path, default_timeout=5.0)
+        at.run(timeout=5.0)
+
+        assert not at.exception
+
+        # Trigger AI suggestion button
+        ai_buttons = [b for b in at.button if "Suggest meanings and units with Gemma 4" in b.label]
+        if ai_buttons:
+            ai_buttons[0].click()
+            at.run(timeout=5.0)
+            assert not at.exception
+            # Verify the required warning message is displayed
+            assert any(expected_msg in w.value for w in at.warning)
+
+        # Deterministic check still works
+        check_buttons = [b for b in at.button if "Check expression" in b.label]
+        assert len(check_buttons) >= 1
+        check_buttons[0].click()
+        at.run(timeout=5.0)
+        assert not at.exception
+        assert any("PASS" in s.value for s in at.success)
+
+

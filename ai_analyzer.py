@@ -27,7 +27,8 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Dict, List, Optional
+import time
+from typing import Any, Callable, Dict, List, Optional
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
@@ -77,8 +78,87 @@ class AIAnalyzerTimeoutError(AIAnalysisError):
     """Raised when an API request times out."""
 
 
+class ServiceUnavailableError(AIAnalysisError):
+    """Raised when the AI service is temporarily unavailable (HTTP 503 or 5xx) after retries."""
+
+
+class RetriesExhaustedError(AIAnalysisError):
+    """Raised when transient retries for 503, 429, or 5xx are exhausted."""
+
+
 class MalformedResponseError(AIAnalysisError):
     """Raised when model output fails JSON parsing or schema validation."""
+
+
+# Retry configuration defaults
+DEFAULT_MAX_RETRIES = 3
+DEFAULT_INITIAL_DELAY = 1.0  # seconds
+DEFAULT_BACKOFF_FACTOR = 2.0
+DEFAULT_MAX_DELAY = 8.0
+DEFAULT_OVERALL_TIMEOUT = 30.0  # seconds
+
+# Transient retryable HTTP status codes
+RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
+
+
+def sanitize_error_message(msg: str, secret: Optional[str] = None) -> str:
+    """Mask API keys or credentials from error messages to protect secrets."""
+    if not msg:
+        return ""
+    import re
+    cleaned = str(msg)
+    if secret and secret.strip():
+        cleaned = cleaned.replace(secret.strip(), "***REDACTED***")
+    # Redact standard Gemini API key format (AIzaSy...)
+    cleaned = re.sub(r"AIzaSy[A-Za-z0-9_-]{33}", "***REDACTED***", cleaned)
+    # Redact any generic key= or api_key= pattern
+    cleaned = re.sub(r"(api[_-]?key\s*[:=]\s*)[^\s,;&'\"]+", r"\1***REDACTED***", cleaned, flags=re.IGNORECASE)
+    return cleaned
+
+
+def is_retryable_error(exc: Exception) -> bool:
+    """Determine whether an error is transient and retryable (503, 429, 5xx, timeout).
+
+    Non-retryable errors (e.g. 401, 403, 404, bad requests, invalid API key) return False.
+    """
+    # 1. Official Google GenAI API errors
+    if isinstance(exc, errors.APIError):
+        code = getattr(exc, "code", None)
+        # Explicit non-retryable status codes
+        if code in (400, 401, 403, 404, 422):
+            return False
+
+        # Retryable status codes: 503, 429, 408, and all 5xx
+        if code in RETRYABLE_STATUS_CODES or (code is not None and 500 <= code < 600):
+            return True
+
+        status = str(getattr(exc, "status", "") or "").upper()
+        if any(term in status for term in ("UNAVAILABLE", "RESOURCE_EXHAUSTED", "DEADLINE_EXCEEDED")):
+            return True
+
+        msg = str(getattr(exc, "message", "") or str(exc)).lower()
+        if "503" in msg or "service unavailable" in msg or "temporarily unavailable" in msg:
+            return True
+
+        return False
+
+    # 2. Specific PhysCheck transient exceptions
+    if isinstance(exc, (ServiceUnavailableError, QuotaExceededError, AIAnalyzerTimeoutError)):
+        return True
+
+    # 3. Non-retryable PhysCheck exceptions
+    if isinstance(exc, (MissingAPIKeyError, AuthenticationError, UnsupportedModelError, MalformedResponseError, ValueError)):
+        return False
+
+    # 4. Check error string for transient network/server keywords while excluding client/auth errors
+    err_str = str(exc).lower()
+    if any(auth_term in err_str for term in ("unauthenticated", "401", "403", "forbidden", "api_key_invalid", "404", "not found")):
+        return False
+
+    if any(transient_term in err_str for transient_term in ("503", "service unavailable", "timed out", "timeout", "connection reset", "connection refused", "502 bad gateway")):
+        return True
+
+    return False
 
 
 # ============================================================================
@@ -243,6 +323,11 @@ class AIAnalyzer:
         model: str = DEFAULT_MODEL_IDENTIFIER,
         client: Optional[genai.Client] = None,
         timeout: Optional[float] = 30.0,
+        max_retries: int = DEFAULT_MAX_RETRIES,
+        initial_delay: float = DEFAULT_INITIAL_DELAY,
+        backoff_factor: float = DEFAULT_BACKOFF_FACTOR,
+        max_delay: float = DEFAULT_MAX_DELAY,
+        overall_timeout: Optional[float] = DEFAULT_OVERALL_TIMEOUT,
     ):
         """Initialize AIAnalyzer.
 
@@ -251,15 +336,28 @@ class AIAnalyzer:
             model: Model identifier. Defaults strictly to 'gemma-4-31b-it'.
             client: Optional pre-configured genai.Client (useful for testing/mocking).
             timeout: API timeout in seconds.
+            max_retries: Maximum number of retries for transient errors (default 3).
+            initial_delay: Initial retry backoff delay in seconds (default 1.0).
+            backoff_factor: Exponential backoff multiplier (default 2.0).
+            max_delay: Maximum delay cap between retries in seconds (default 8.0).
+            overall_timeout: Maximum overall timeout across retries in seconds (default 30.0).
         """
         self.model = model
         self.timeout = timeout
+        self.max_retries = max_retries
+        self.initial_delay = initial_delay
+        self.backoff_factor = backoff_factor
+        self.max_delay = max_delay
+        self.overall_timeout = overall_timeout
         self._raw_api_key = api_key
         self._client = client
 
     def __repr__(self) -> str:
         # Prevent API key leakage in logs or representations
-        return f"AIAnalyzer(model={self.model!r}, timeout={self.timeout!r}, api_key='***REDACTED***')"
+        return (
+            f"AIAnalyzer(model={self.model!r}, timeout={self.timeout!r}, "
+            f"max_retries={self.max_retries}, api_key='***REDACTED***')"
+        )
 
     def _get_client(self) -> genai.Client:
         """Initialize or return the genai.Client without exposing credentials."""
@@ -267,13 +365,20 @@ class AIAnalyzer:
             return self._client
 
         api_key = self._raw_api_key or get_gemini_api_key()
-        self._client = genai.Client(api_key=api_key)
+        # Explicitly configure attempts=1 in SDK client options so the SDK does not perform
+        # duplicate internal retries; PhysCheck manages retries with backoff and UI feedback.
+        http_options = types.HttpOptions(
+            retry_options=types.HttpRetryOptions(attempts=1),
+            timeout=int(self.timeout * 1000) if self.timeout else None,
+        )
+        self._client = genai.Client(api_key=api_key, http_options=http_options)
         return self._client
 
     def analyze_expression(
         self,
         expression: str,
         context: Optional[str] = None,
+        on_retry: Optional[Callable[[int, int, float, Exception], None]] = None,
     ) -> AIAnalysisResult:
         """Analyze a physical formula or expression and produce structured physical reasoning.
 
@@ -283,6 +388,7 @@ class AIAnalyzer:
         Args:
             expression: Mathematical expression or formula string (e.g. 'E = m * c ** 2').
             context: Optional domain context (e.g. 'special relativity, rest mass energy').
+            on_retry: Optional callback invoked before each retry with (attempt, max_retries, delay, exception).
 
         Returns:
             AIAnalysisResult with candidate units (suggestions only until confirmed),
@@ -316,29 +422,53 @@ class AIAnalyzer:
             response_schema=AIAnalysisResult,
         )
 
-        try:
-            response = client.models.generate_content(
-                model=self.model,
-                contents=prompt,
-                config=config,
-            )
-        except errors.APIError as e:
-            self._handle_api_error(e)
-        except Exception as e:
-            # Check for network timeout or other wrapped transport errors
-            error_str = str(e).lower()
-            if "timeout" in error_str or "timed out" in error_str:
-                raise AIAnalyzerTimeoutError(f"Request timed out while analyzing expression: {e}") from e
-            if "quota" in error_str or "resource_exhausted" in error_str:
-                raise QuotaExceededError(f"API quota exceeded: {e}") from e
-            if "unauthenticated" in error_str or "api_key_invalid" in error_str:
-                raise AuthenticationError(f"API authentication failed: {e}") from e
-            if "not found" in error_str and self.model in str(e):
-                raise UnsupportedModelError(
-                    f"Requested model '{self.model}' is not available or unsupported by API provider. "
-                    f"PhysCheck will not silently substitute another model."
-                ) from e
-            raise AIAnalysisError(f"API request failed: {e}") from e
+        start_time = time.time()
+        attempt = 0
+        response = None
+
+        while attempt <= self.max_retries:
+            # Check overall timeout before making API request
+            if self.overall_timeout is not None and (time.time() - start_time) > self.overall_timeout:
+                raise AIAnalyzerTimeoutError(
+                    f"Overall timeout of {self.overall_timeout}s exceeded while analyzing expression."
+                )
+
+            try:
+                response = client.models.generate_content(
+                    model=self.model,
+                    contents=prompt,
+                    config=config,
+                )
+                break
+            except Exception as e:
+                # 1. Non-retryable errors fail immediately without retry
+                if not is_retryable_error(e):
+                    if isinstance(e, errors.APIError):
+                        self._handle_api_error(e)
+                    self._handle_general_exception(e)
+
+                # 2. Transient error: check if retries exhausted
+                if attempt >= self.max_retries:
+                    self._handle_retries_exhausted(e, attempt)
+
+                # 3. Compute exponential backoff delay
+                delay = min(self.initial_delay * (self.backoff_factor ** attempt), self.max_delay)
+
+                # Check overall timeout before sleeping
+                if self.overall_timeout is not None and (time.time() - start_time + delay) > self.overall_timeout:
+                    raise AIAnalyzerTimeoutError(
+                        f"Overall timeout of {self.overall_timeout}s exceeded while waiting to retry."
+                    ) from e
+
+                # 4. Notify caller (e.g. UI) of retry
+                if on_retry is not None:
+                    try:
+                        on_retry(attempt + 1, self.max_retries, delay, e)
+                    except Exception:
+                        pass
+
+                time.sleep(delay)
+                attempt += 1
 
         # Validate response content
         if not response or not getattr(response, "text", None):
@@ -359,14 +489,37 @@ class AIAnalyzer:
                 f"Model response failed schema validation or JSON decoding: {e}"
             ) from e
 
+    def _handle_retries_exhausted(self, e: Exception, attempts_made: int) -> None:
+        """Handle exhausted retries for transient errors."""
+        code = getattr(e, "code", None)
+        clean_msg = sanitize_error_message(str(e))
+        clean_lower = clean_msg.lower()
+
+        if code == 429 or "quota" in clean_lower or "resource_exhausted" in clean_lower:
+            raise QuotaExceededError(
+                f"API quota or rate limit exceeded after {attempts_made} retries: {clean_msg}"
+            ) from e
+
+        if code in (408, 504) or "timeout" in clean_lower or "deadline_exceeded" in clean_lower:
+            raise AIAnalyzerTimeoutError(
+                f"API request timed out after {attempts_made} retries: {clean_msg}"
+            ) from e
+
+        # HTTP 503 Service Unavailable or general 5xx Server Error
+        raise ServiceUnavailableError(
+            "AI suggestions are temporarily unavailable. You can enter variable meanings and units manually, or try again later."
+        ) from e
+
     def _handle_api_error(self, e: errors.APIError) -> None:
         """Map official google.genai errors.APIError to specific PhysCheck exceptions.
 
         STRICT RULE: Never silently substitute a different model if the requested model is unavailable.
+        Never expose API key in error messages.
         """
         code = getattr(e, "code", None)
         msg = getattr(e, "message", str(e))
-        msg_lower = msg.lower()
+        clean_msg = sanitize_error_message(str(msg))
+        msg_lower = clean_msg.lower()
 
         # 401 / 403 Authentication & Permission errors
         if code in (401, 403) or "unauthenticated" in msg_lower or "api_key_invalid" in msg_lower:
@@ -385,24 +538,51 @@ class AIAnalyzer:
             or "unsupported" in msg_lower
         ):
             raise UnsupportedModelError(
-                f"Requested model '{self.model}' is not available or unsupported by the API provider (status {code}): {msg}. "
+                f"Requested model '{self.model}' is not available or unsupported by the API provider (status {code}): {clean_msg}. "
                 f"PhysCheck will not silently substitute a different model."
             ) from e
 
         # 429 Quota / Rate limit
         if code == 429 or "resource_exhausted" in msg_lower or "quota" in msg_lower:
             raise QuotaExceededError(
-                f"API quota or rate limit exceeded (status {code}): {msg}"
+                f"API quota or rate limit exceeded (status {code}): {clean_msg}"
             ) from e
 
         # Timeout indications
         if code in (408, 504) or "timeout" in msg_lower or "deadline_exceeded" in msg_lower:
             raise AIAnalyzerTimeoutError(
-                f"API request timed out (status {code}): {msg}"
+                f"API request timed out (status {code}): {clean_msg}"
             ) from e
 
-        # General API error
-        raise AIAnalysisError(f"API error occurred (status {code}): {msg}") from e
+        # 503 Service Unavailable / 5xx Server Error
+        if code == 503 or (code is not None and 500 <= code < 600) or "unavailable" in msg_lower:
+            raise ServiceUnavailableError(
+                "AI suggestions are temporarily unavailable. You can enter variable meanings and units manually, or try again later."
+            ) from e
+
+        # General API error (e.g. 400 Bad Request)
+        raise AIAnalysisError(f"API error occurred (status {code}): {clean_msg}") from e
+
+    def _handle_general_exception(self, e: Exception) -> None:
+        """Handle transport or generic non-API exceptions securely."""
+        clean_str = sanitize_error_message(str(e))
+        error_str = clean_str.lower()
+        if "timeout" in error_str or "timed out" in error_str:
+            raise AIAnalyzerTimeoutError(f"Request timed out while analyzing expression: {clean_str}") from e
+        if "quota" in error_str or "resource_exhausted" in error_str:
+            raise QuotaExceededError(f"API quota exceeded: {clean_str}") from e
+        if "unauthenticated" in error_str or "api_key_invalid" in error_str:
+            raise AuthenticationError(f"API authentication failed: {clean_str}") from e
+        if "not found" in error_str and self.model in clean_str:
+            raise UnsupportedModelError(
+                f"Requested model '{self.model}' is not available or unsupported by API provider. "
+                f"PhysCheck will not silently substitute another model."
+            ) from e
+        if "503" in error_str or "service unavailable" in error_str:
+            raise ServiceUnavailableError(
+                "AI suggestions are temporarily unavailable. You can enter variable meanings and units manually, or try again later."
+            ) from e
+        raise AIAnalysisError(f"API request failed: {clean_str}") from e
 
 
 def analyze_expression_with_ai(
@@ -410,6 +590,7 @@ def analyze_expression_with_ai(
     context: Optional[str] = None,
     api_key: Optional[str] = None,
     model: str = DEFAULT_MODEL_IDENTIFIER,
+    on_retry: Optional[Callable[[int, int, float, Exception], None]] = None,
 ) -> AIAnalysisResult:
     """Convenience helper to analyze an expression using AIAnalyzer.
 
@@ -417,4 +598,4 @@ def analyze_expression_with_ai(
     Transmits the expression and context over the network to the configured API provider.
     """
     analyzer = AIAnalyzer(api_key=api_key, model=model)
-    return analyzer.analyze_expression(expression=expression, context=context)
+    return analyzer.analyze_expression(expression=expression, context=context, on_retry=on_retry)
