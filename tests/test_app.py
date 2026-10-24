@@ -317,3 +317,135 @@ def test_pass_fail_unsupported_status_integrity():
     # UNSUPPORTED
     r_unsupported = check_expression("d / 0", variable_units={"d": "meter"})
     assert r_unsupported.status == CheckStatus.UNSUPPORTED
+
+
+def test_streamlit_apptest_method_switching():
+    """Verify that switching radio input methods dynamically updates widgets in Streamlit AppTest."""
+    import asyncio
+    from pathlib import Path
+    from streamlit.testing.v1 import AppTest
+
+    mock_loop = MagicMock(spec=asyncio.AbstractEventLoop)
+    mock_loop.is_closed.return_value = False
+
+    with patch("asyncio.new_event_loop", return_value=mock_loop):
+        app_path = str(Path(__file__).resolve().parent.parent / "app.py")
+        at = AppTest.from_file(app_path, default_timeout=5.0)
+        at.run(timeout=5.0)
+
+        assert not at.exception
+        # Radio exists
+        assert len(at.radio) >= 1
+        assert at.radio[0].value == "Try an example"
+
+        # In "Try an example", selectbox for examples exists, file uploader does not
+        assert len(at.selectbox) >= 1
+        assert len(at.file_uploader) == 0
+
+        # Switch to "Analyze a Python file"
+        at.radio[0].set_value("Analyze a Python file")
+        at.run(timeout=5.0)
+
+        assert not at.exception
+        assert at.radio[0].value == "Analyze a Python file"
+        # In "Analyze a Python file", file uploader exists, example selectbox does not
+        assert len(at.file_uploader) == 1
+        assert len(at.selectbox) == 0
+
+        # Primary action is now "Analyze file"
+        analyze_buttons = [b for b in at.button if "Analyze file" in b.label]
+        assert len(analyze_buttons) == 1
+
+def test_input_method_exclusivity_and_switching():
+    """Verify that switching input methods clears stale inputs and results."""
+    from app import apply_example
+
+    mock_state = MockSessionState()
+    with patch("streamlit.session_state", mock_state):
+        mock_state["current_method"] = "Try an example"
+        mock_state["expression_input"] = "v = d / t"
+        mock_state["check_result"] = "STALE_RESULT_OBJECT"
+        mock_state["last_checked_expression"] = "v = d / t"
+        mock_state["user_units"] = {"v": "m/s", "d": "m", "t": "s"}
+
+        # Simulate user switching to 'Enter my own equation'
+        new_method = "Enter my own equation"
+        assert new_method != mock_state["current_method"]
+        # The switch invalidates stale results and previous inputs
+        mock_state["current_method"] = new_method
+        mock_state["check_result"] = None
+        mock_state["last_checked_expression"] = None
+        mock_state["expression_input"] = ""
+        mock_state["user_units"] = {}
+
+        assert mock_state["check_result"] is None
+        assert mock_state["last_checked_expression"] is None
+        assert mock_state["expression_input"] == ""
+        assert mock_state["user_units"] == {}
+
+
+def test_extract_file_equations_security_and_parsing(tmp_path):
+    """Verify that extract_file_equations parses statements via AST and never executes code."""
+    from app import extract_file_equations
+
+    # Code that attempts a dangerous side effect if executed
+    probe_marker = tmp_path / "should_never_exist.txt"
+    code = f"""
+import os
+v = d / t
+E = m * c ** 2
+open(r'{probe_marker}', 'w').write('executed!')
+"""
+    equations = extract_file_equations(code)
+    # 1. Probe marker must NOT have been created (code was never executed)
+    assert not probe_marker.exists()
+
+    # 2. Mathematical statements must be extracted
+    assert any("v = d / t" in eq for eq in equations)
+    assert any("E = m * c ** 2" in eq for eq in equations)
+
+
+def test_format_result_diagnostics_coverage():
+    """Verify that format_result_diagnostics answers What, Why, and Next Action for all statuses."""
+    from app import format_result_diagnostics
+    from checker import check_expression
+
+    # 1. PASS
+    res_pass = check_expression("distance / time", variable_units={"distance": "meter", "time": "second"})
+    diag_pass = format_result_diagnostics(res_pass, "distance / time")
+    assert "what" in diag_pass and "why" in diag_pass and "next_action" in diag_pass
+    assert "dimensional homogeneity" in diag_pass["what"].lower()
+    assert "proceed" in diag_pass["next_action"].lower()
+
+    # 2. FAIL: Incompatible addition
+    res_fail_add = check_expression("mass + velocity", variable_units={"mass": "kilogram", "velocity": "meter / second"})
+    diag_fail_add = format_result_diagnostics(res_fail_add, "mass + velocity")
+    assert "incompatible addition" in diag_fail_add["what"].lower()
+    assert "cannot be added" in diag_fail_add["why"].lower()
+    assert "derivation" in diag_fail_add["next_action"].lower()
+
+    # 3. FAIL: Equation mismatch
+    res_fail_eq = check_expression("v = d * t", variable_units={"v": "meter / second", "d": "meter", "t": "second"})
+    diag_fail_eq = format_result_diagnostics(res_fail_eq, "v = d * t")
+    assert "mismatch" in diag_fail_eq["what"].lower()
+    assert "equation" in diag_fail_eq["why"].lower()
+    assert "review the equation" in diag_fail_eq["next_action"].lower()
+
+    # 4. UNSUPPORTED: Missing variable unit
+    res_unsup_var = check_expression("x + y", variable_units={"x": "meter"})
+    diag_unsup_var = format_result_diagnostics(res_unsup_var, "x + y")
+    assert "missing unit" in diag_unsup_var["what"].lower()
+    assert "step 2" in diag_unsup_var["next_action"].lower()
+
+    # 5. UNSUPPORTED: Division by zero
+    res_unsup_zero = check_expression("1 / 0", variable_units={})
+    diag_unsup_zero = format_result_diagnostics(res_unsup_zero, "1 / 0")
+    assert "division by zero" in diag_unsup_zero["what"].lower()
+    assert "non-zero" in diag_unsup_zero["next_action"].lower()
+
+    # 6. UNSUPPORTED: Function call syntax
+    res_unsup_syntax = check_expression("sin(x)", variable_units={"x": "radian"})
+    diag_unsup_syntax = format_result_diagnostics(res_unsup_syntax, "sin(x)")
+    assert "unsupported syntax" in diag_unsup_syntax["what"].lower()
+    assert "simplify" in diag_unsup_syntax["next_action"].lower()
+

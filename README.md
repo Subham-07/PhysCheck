@@ -66,7 +66,7 @@ PhysCheck/
     ├── test_sanity.py         # Environment and dependency sanity tests
     ├── test_checker.py        # 13 tests for AST rules, Pint units, and dimensional logic
     ├── test_ai_analyzer.py    # 13 mocked tests for Gemma 4 integration and error states
-    ├── test_app.py            # 14 tests for Streamlit UI workflow and security limits
+    ├── test_app.py            # 18 tests for Streamlit UI guided workflow, exclusivity, and security limits
     └── test_verify_math.py    # 6 end-to-end CLI integration tests
 ```
 
@@ -160,13 +160,12 @@ Launch the interactive scientific interface:
 
 The application will start locally (typically at `http://localhost:8501`).
 
-#### Web Application Workflow:
-1. **Section A (Input Formulation)**: Choose a built-in example from the dropdown, enter an expression manually, or upload a `.py` file (plain-text inspection, $\le 50\text{ KB}$).
-2. **Section B (Variable Extraction & Unit Assumptions)**: Review the real variables detected in your expression. Enter Pint-compatible units (e.g., `meter`, `second`, `kilogram`).
-3. **Section C (Optional AI Analysis)**: Click **Analyze Formulation with Gemma 4** to fetch physical interpretations and proposed units from the `gemma-4-31b-it` model.
-4. **Section D (Unit Confirmation)**: Inspect candidate units and click **Confirm Units for Verification** to authorize them for calculation.
-5. **Section E (Deterministic Verification)**: Click **Run Deterministic Physics Check** to execute the AST dimensional auditor.
-6. **Section F (Results & Diagnostics)**: Inspect the structured result status (`PASS`, `FAIL`, or `UNSUPPORTED`), exact check performed, dimensional evidence, and next steps.
+#### Web Application Guided Workflow:
+1. **Choose Input Method**: Select exactly one workflow: **Try an example**, **Enter my own equation**, or **Analyze a Python file**. Switching methods invalidates stale inputs and results.
+2. **Step 1 — Input**: Select a verified physics example with demonstration context, enter a manual mathematical expression, or upload a `.py` script (inspected safely as static text, max 50 KB, never executed).
+3. **Step 2 — Confirm Variables and Units**: Review the variables extracted automatically via AST. Set meanings and Pint-compatible units, or optionally request candidate suggestions from Gemma 4 (`gemma-4-31b-it`). Review and confirm units.
+4. **Step 3 — Check**: Click **Check expression** (or **Analyze file**). Incomplete or unconfirmed units block checking with clear guidance.
+5. **Your Results**: Review the diagnostic result (`PASS`, `FAIL`, or `UNSUPPORTED`), dimensional evidence, and structured answers to: *What did PhysCheck find?*, *Why does it matter?*, and *What should I do next?*
 
 ---
 
@@ -267,7 +266,7 @@ Disclaimer:      PASS means only that the supported check passed under the suppl
 
 ## Running Automated Tests
 
-PhysCheck includes an automated test suite with 46 tests covering sanity checks, deterministic AST evaluation, Pint dimensional compatibility, mocked Gemma 4 API integrations, CLI behavior, and Streamlit workflows.
+PhysCheck includes an automated test suite with 50 tests covering sanity checks, deterministic AST evaluation, Pint dimensional compatibility, mocked Gemma 4 API integrations, CLI behavior, and Streamlit workflows.
 
 Execute the test suite using pytest:
 ```powershell
@@ -443,7 +442,7 @@ Contributions to PhysCheck are welcome! Please observe the following principles:
 1. **Preserve Safety Guarantees**: Never introduce `eval()`, `exec()`, or dynamic code execution into equation evaluation.
 2. **Preserve Disclaimer Integrity**: Any new reporting or output mode must preserve the mandatory disclaimer that `PASS` applies strictly to supported checks under confirmed assumptions.
 3. **Strict Human Confirmation**: AI-generated units must always remain preliminary suggestions until confirmed by a user.
-4. **Comprehensive Testing**: All new features or syntax support must include corresponding tests in `tests/`. Ensure all 46 existing tests pass:
+4. **Comprehensive Testing**: All new features or syntax support must include corresponding tests in `tests/`. Ensure all 50 existing tests pass:
    ```powershell
    .\.venv\Scripts\python.exe -m pytest -v
    ```
